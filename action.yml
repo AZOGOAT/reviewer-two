@@ -15,8 +15,11 @@ inputs:
     description: Total token cap; when spent, the review wraps up with what it has found
     default: "5000000"
   context_window_tokens:
-    description: Context window of the model in tokens; exploration wraps up 50k before it fills
+    description: Context window of the model in tokens; sets how much diff goes in the prompt, and exploration wraps up 50k before it fills
     default: "200000"
+  reasoning_effort:
+    description: How hard the model reasons (none, minimal, low, medium, high, xhigh, max); empty keeps the model's default. Claude takes low to max, OpenAI models without reasoning ignore it, OpenAI-compatible servers decide what each value means
+    default: ""
   max_inline_comments:
     description: Maximum inline review comments; the rest go into the review body
     default: "15"

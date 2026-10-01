@@ -3,6 +3,17 @@ import { z } from "zod";
 export const severities = ["critical", "major", "minor", "nit"] as const;
 export type Severity = (typeof severities)[number];
 
+export const reasoningEfforts = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+export type ReasoningEffort = (typeof reasoningEfforts)[number];
+
 /** One reviewer finding, anchored to a file and line in the PR head. */
 export const findingSchema = z.object({
   path: z.string().min(1).describe("Repository-relative path of the file"),

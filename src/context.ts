@@ -178,7 +178,13 @@ function filesFromListFiles(
     }));
 }
 
-const DEFAULT_MAX_DIFF_CHARS = 300_000;
+// Code runs about 4 chars per token, so the diff stays near a third of the window.
+const DIFF_CHARS_PER_WINDOW_TOKEN = 1.5;
+
+/** Character cap on the diff placed in the prompt, scaled to the model's context window. */
+export function diffCharBudget(contextWindowTokens: number): number {
+  return Math.floor(contextWindowTokens * DIFF_CHARS_PER_WINDOW_TOKEN);
+}
 
 /**
  * Keeps the total patch size under maxChars by dropping the largest file
@@ -186,7 +192,7 @@ const DEFAULT_MAX_DIFF_CHARS = 300_000;
  */
 export function degradeIfOversized(
   files: FileDiff[],
-  maxChars = DEFAULT_MAX_DIFF_CHARS,
+  maxChars: number,
 ): { files: FileDiff[]; skipped: string[] } {
   let total = files.reduce((n, f) => n + f.patch.length, 0);
   if (total <= maxChars) return { files, skipped: [] };
@@ -203,10 +209,11 @@ export function degradeIfOversized(
   };
 }
 
-/** Fetches PR metadata and diff, applying excludes and the oversize guard. */
+/** Fetches PR metadata and diff, applying excludes and the diff budget. */
 export async function gatherPr(
   octokit: Octokit,
   ref: PrRef,
+  maxDiffChars: number,
 ): Promise<PrContext> {
   const { owner, repo, pullNumber } = ref;
   const pr = await octokit.rest.pulls.get({
@@ -245,7 +252,7 @@ export async function gatherPr(
     )
     .map((f) => f.filename);
   const reviewable = allFiles.filter((f) => !isExcluded(f.path));
-  const { files, skipped } = degradeIfOversized(reviewable);
+  const { files, skipped } = degradeIfOversized(reviewable, maxDiffChars);
   return {
     meta: {
       title: pr.data.title,

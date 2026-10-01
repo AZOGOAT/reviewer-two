@@ -48454,6 +48454,15 @@ config(en_default());
 
 // src/schema.ts
 var severities = ["critical", "major", "minor", "nit"];
+var reasoningEfforts = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max"
+];
 var findingSchema = external_exports.object({
   path: external_exports.string().min(1).describe("Repository-relative path of the file"),
   line: external_exports.number().int().positive().describe(
@@ -48743,8 +48752,11 @@ function filesFromListFiles(prFiles) {
     commentableLines: commentableLinesFromPatch(f.patch)
   }));
 }
-var DEFAULT_MAX_DIFF_CHARS = 3e5;
-function degradeIfOversized(files, maxChars = DEFAULT_MAX_DIFF_CHARS) {
+var DIFF_CHARS_PER_WINDOW_TOKEN = 1.5;
+function diffCharBudget(contextWindowTokens) {
+  return Math.floor(contextWindowTokens * DIFF_CHARS_PER_WINDOW_TOKEN);
+}
+function degradeIfOversized(files, maxChars) {
   let total = files.reduce((n, f) => n + f.patch.length, 0);
   if (total <= maxChars) return { files, skipped: [] };
   const bySize = [...files].sort((a, b) => b.patch.length - a.patch.length);
@@ -48759,7 +48771,7 @@ function degradeIfOversized(files, maxChars = DEFAULT_MAX_DIFF_CHARS) {
     skipped: [...skippedSet]
   };
 }
-async function gatherPr(octokit, ref) {
+async function gatherPr(octokit, ref, maxDiffChars) {
   const { owner, repo, pullNumber } = ref;
   const pr = await octokit.rest.pulls.get({
     owner,
@@ -48793,7 +48805,7 @@ async function gatherPr(octokit, ref) {
     (f) => !f.patch && !present.has(f.filename) && !isExcluded(f.filename)
   ).map((f) => f.filename);
   const reviewable = allFiles.filter((f) => !isExcluded(f.path));
-  const { files, skipped } = degradeIfOversized(reviewable);
+  const { files, skipped } = degradeIfOversized(reviewable, maxDiffChars);
   return {
     meta: {
       title: pr.data.title,
@@ -84978,9 +84990,50 @@ function resolveModel(id) {
     `Unsupported model "${id}". Use a claude-* id (Anthropic), a gpt-*/o* id (OpenAI), or an org/model id served by an OpenAI-compatible endpoint.`
   );
 }
+var CLAUDE_EFFORTS = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max"
+];
+function checkReasoningEffort(modelId, reasoningEffort) {
+  if (reasoningEffort !== void 0 && modelId.startsWith("claude-") && !CLAUDE_EFFORTS.includes(reasoningEffort)) {
+    throw new Error(
+      `Input reasoning_effort "${reasoningEffort}" is not available for Claude models; use one of ${CLAUDE_EFFORTS.join(", ")}`
+    );
+  }
+}
 var responseFormatOnlyWithoutTools = {
   transformParams: async ({ params }) => params.tools?.length ? { ...params, responseFormat: void 0 } : params
 };
+var RATE_LIMIT_MAX_WAIT_MS = 60 * 6e4;
+var RETRY_AFTER_MIN_S = 5;
+var RETRY_AFTER_MAX_S = 10;
+var RETRY_AFTER_DEFAULT_S = 10;
+function waitOnRateLimit(fetchImpl, maxWaitMs) {
+  let waited = 0;
+  return async (input, init) => {
+    for (; ; ) {
+      const res = await fetchImpl(input, init);
+      if (res.status !== 429) return res;
+      const header = Number.parseFloat(res.headers.get("retry-after") ?? "");
+      const seconds = Number.isFinite(header) ? Math.min(Math.max(header, RETRY_AFTER_MIN_S), RETRY_AFTER_MAX_S) : RETRY_AFTER_DEFAULT_S;
+      const ms = seconds * 1e3 + Math.random() * 2e3;
+      if (waited + ms > maxWaitMs) return res;
+      const said = (await res.text()).slice(0, 300);
+      info(
+        `Model endpoint answered 429, retrying in ${Math.round(ms / 1e3)}s: ${said}`
+      );
+      await new Promise((resolve2) => setTimeout(resolve2, ms));
+      waited += ms;
+    }
+  };
+}
+var rateLimitedFetch = waitOnRateLimit(
+  (input, init) => globalThis.fetch(input, init),
+  RATE_LIMIT_MAX_WAIT_MS
+);
 function openAiCompatibleModel(id) {
   const baseURL = process.env.OPENAI_COMPATIBLE_BASE_URL;
   if (!baseURL) {
@@ -84992,7 +85045,8 @@ function openAiCompatibleModel(id) {
     name: "openai-compatible",
     baseURL,
     apiKey: process.env.OPENAI_COMPATIBLE_API_KEY,
-    supportsStructuredOutputs: true
+    supportsStructuredOutputs: true,
+    fetch: rateLimitedFetch
   })(id);
   return wrapLanguageModel({
     model,
@@ -85091,12 +85145,20 @@ function promptMessages(prompt) {
   const parts = typeof prompt === "string" ? [prompt] : prompt;
   return parts.map((content) => ({ role: "user", content }));
 }
+function callProviderOptions(reasoningEffort) {
+  if (reasoningEffort === void 0) {
+    return { anthropic: { structuredOutputMode: "jsonTool" } };
+  }
+  return {
+    anthropic: { structuredOutputMode: "jsonTool", effort: reasoningEffort },
+    openai: { reasoningEffort, reasoningSummary: null },
+    openaiCompatible: { reasoningEffort }
+  };
+}
 async function runStructured(opts) {
   const maxToolCalls = opts.maxToolCalls;
   const model = typeof opts.modelId === "string" ? resolveModel(opts.modelId) : opts.modelId;
-  const providerOptions = {
-    anthropic: { structuredOutputMode: "jsonTool" }
-  };
+  const providerOptions = callProviderOptions(opts.reasoningEffort);
   const system = typeof opts.modelId === "string" && opts.modelId.includes("/") ? `${opts.system}
 
 ${schemaAsPromptText(opts.schema)}` : opts.system;
@@ -85841,6 +85903,15 @@ function fitSuggestion(finding, patch) {
 // src/verify.ts
 var VERIFY_TOOL_CALLS = 10;
 var MAX_VERIFIED_FINDINGS = 20;
+function describeError(err) {
+  const parts = [];
+  let current = err;
+  while (current !== void 0 && parts.length < 4) {
+    parts.push(current instanceof Error ? current.message : String(current));
+    current = current instanceof Error ? current.cause : void 0;
+  }
+  return parts.join(" <- caused by: ");
+}
 async function verifyFindings(opts) {
   const confirmed = [];
   const discarded = [];
@@ -85895,7 +85966,8 @@ async function verifyFindings(opts) {
         schema: verificationSchema,
         tools: opts.tools,
         maxToolCalls: VERIFY_TOOL_CALLS,
-        contextWindowTokens: opts.contextWindowTokens
+        contextWindowTokens: opts.contextWindowTokens,
+        reasoningEffort: opts.reasoningEffort
       });
       usage = addUsage(usage, callUsage);
       if (output.verdict === "confirmed") {
@@ -85907,7 +85979,7 @@ async function verifyFindings(opts) {
       }
     } catch (err) {
       warning(
-        `Verification call failed for ${finding.path}:${finding.line}: ${err instanceof Error ? err.message : String(err)}`
+        `Verification call failed for ${finding.path}:${finding.line}: ${describeError(err)}`
       );
       if (reReview) unverified.push(finding);
       else confirm(finding, { suggestion: "drop" });
@@ -85980,6 +86052,16 @@ function severityInput(name26, fallback) {
   }
   return raw;
 }
+function reasoningEffortInput() {
+  const raw = getInput("reasoning_effort");
+  if (!raw) return void 0;
+  if (!reasoningEfforts.includes(raw)) {
+    throw new Error(
+      `Input reasoning_effort must be one of ${reasoningEfforts.join(", ")}, got "${raw}"`
+    );
+  }
+  return raw;
+}
 var DEFAULT_TOKEN_BUDGET = 5e6;
 function describeUsage(usage) {
   return `${usage.noCache} uncached, ${usage.cacheRead} cache reads, ${usage.cacheWrite} cache writes, ${usage.output} output`;
@@ -85996,14 +86078,18 @@ function numberInput(name26, fallback) {
   return value;
 }
 function readInputs() {
+  const model = getInput("model") || "claude-opus-4-8";
+  const reasoningEffort = reasoningEffortInput();
+  checkReasoningEffort(model, reasoningEffort);
   return {
-    model: getInput("model") || "claude-opus-4-8",
+    model,
     maxToolCalls: numberInput("max_tool_calls", 50),
     explorationTokenBudget: numberInput(
       "exploration_token_budget",
       DEFAULT_TOKEN_BUDGET
     ),
     contextWindowTokens: numberInput("context_window_tokens", 2e5),
+    reasoningEffort,
     maxInlineComments: numberInput("max_inline_comments", 15),
     inlineSeverityThreshold: severityInput(
       "inline_severity_threshold",
@@ -86080,7 +86166,11 @@ async function run() {
   const workspace = process.env.GITHUB_WORKSPACE ?? process.cwd();
   const actionRoot = process.env.GITHUB_ACTION_PATH ?? join3(dirname(fileURLToPath(import.meta.url)), "..");
   try {
-    const pr = await gatherPr(octokit, ref);
+    const pr = await gatherPr(
+      octokit,
+      ref,
+      diffCharBudget(inputs.contextWindowTokens)
+    );
     const rules = loadRules(workspace, pr.changedPaths);
     const previous = await fetchPreviousThreads(
       octokit,
@@ -86134,7 +86224,8 @@ async function run() {
       tools,
       maxToolCalls: inputs.maxToolCalls,
       tokenBudget: inputs.explorationTokenBudget,
-      contextWindowTokens: inputs.contextWindowTokens
+      contextWindowTokens: inputs.contextWindowTokens,
+      reasoningEffort: inputs.reasoningEffort
     });
     info(
       `Phase 1 done: ${phase1.output.findings.length} candidate findings, ${phase1.toolCalls} tool calls`
@@ -86169,6 +86260,7 @@ async function run() {
       requestChangesThreshold: inputs.requestChangesThreshold,
       tools,
       contextWindowTokens: inputs.contextWindowTokens,
+      reasoningEffort: inputs.reasoningEffort,
       files: pr.files
     });
     const confirmed = phase2.findings;

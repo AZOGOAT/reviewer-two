@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import * as core from "@actions/core";
 import { context, getOctokit } from "@actions/github";
 import {
+  diffCharBudget,
   fetchPreviousThreads,
   gatherPr,
   type Octokit,
@@ -10,7 +11,11 @@ import {
 } from "./context.js";
 import { makeExploreTools } from "./explore.js";
 import { fetchLinkedIssues, parseIssueRefs } from "./issues.js";
-import { runStructured, type UsageBreakdown } from "./model.js";
+import {
+  checkReasoningEffort,
+  runStructured,
+  type UsageBreakdown,
+} from "./model.js";
 import {
   buildReviewPrompt,
   buildSystemPrompt,
@@ -21,6 +26,8 @@ import { planReview, submitReview, threadStatus } from "./review.js";
 import { loadRules } from "./rules.js";
 import {
   type Finding,
+  type ReasoningEffort,
+  reasoningEfforts,
   reviewOutputSchema,
   type Severity,
   severities,
@@ -34,6 +41,7 @@ export interface Inputs {
   maxToolCalls: number;
   explorationTokenBudget: number;
   contextWindowTokens: number;
+  reasoningEffort: ReasoningEffort | undefined;
   maxInlineComments: number;
   inlineSeverityThreshold: Severity;
   requestChangesThreshold: Severity;
@@ -49,6 +57,18 @@ function severityInput(name: string, fallback: Severity): Severity {
     );
   }
   return raw as Severity;
+}
+
+/** Unset keeps the model's own default reasoning level. */
+function reasoningEffortInput(): ReasoningEffort | undefined {
+  const raw = core.getInput("reasoning_effort");
+  if (!raw) return undefined;
+  if (!(reasoningEfforts as readonly string[]).includes(raw)) {
+    throw new Error(
+      `Input reasoning_effort must be one of ${reasoningEfforts.join(", ")}, got "${raw}"`,
+    );
+  }
+  return raw as ReasoningEffort;
 }
 
 // Sized so a worst-case exploration stays a few dollars with caching on;
@@ -82,14 +102,18 @@ function numberInput(name: string, fallback: number): number {
 
 /** Reads and validates all action inputs. */
 export function readInputs(): Inputs {
+  const model = core.getInput("model") || "claude-opus-4-8";
+  const reasoningEffort = reasoningEffortInput();
+  checkReasoningEffort(model, reasoningEffort);
   return {
-    model: core.getInput("model") || "claude-opus-4-8",
+    model,
     maxToolCalls: numberInput("max_tool_calls", 50),
     explorationTokenBudget: numberInput(
       "exploration_token_budget",
       DEFAULT_TOKEN_BUDGET,
     ),
     contextWindowTokens: numberInput("context_window_tokens", 200_000),
+    reasoningEffort,
     maxInlineComments: numberInput("max_inline_comments", 15),
     inlineSeverityThreshold: severityInput(
       "inline_severity_threshold",
@@ -194,7 +218,11 @@ export async function run(): Promise<void> {
     join(dirname(fileURLToPath(import.meta.url)), "..");
 
   try {
-    const pr = await gatherPr(octokit, ref);
+    const pr = await gatherPr(
+      octokit,
+      ref,
+      diffCharBudget(inputs.contextWindowTokens),
+    );
     const rules = loadRules(workspace, pr.changedPaths);
     const previous = await fetchPreviousThreads(
       octokit,
@@ -251,6 +279,7 @@ export async function run(): Promise<void> {
       maxToolCalls: inputs.maxToolCalls,
       tokenBudget: inputs.explorationTokenBudget,
       contextWindowTokens: inputs.contextWindowTokens,
+      reasoningEffort: inputs.reasoningEffort,
     });
     core.info(
       `Phase 1 done: ${phase1.output.findings.length} candidate findings, ${phase1.toolCalls} tool calls`,
@@ -291,6 +320,7 @@ export async function run(): Promise<void> {
       requestChangesThreshold: inputs.requestChangesThreshold,
       tools,
       contextWindowTokens: inputs.contextWindowTokens,
+      reasoningEffort: inputs.reasoningEffort,
       files: pr.files,
     });
     const confirmed = phase2.findings;

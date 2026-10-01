@@ -21,6 +21,9 @@ on:
       context_window_tokens:
         type: string
         default: "200000"
+      reasoning_effort:
+        type: string
+        default: ""
       max_inline_comments:
         type: string
         default: "15"
@@ -71,6 +74,7 @@ jobs:
           max_tool_calls: ${{ inputs.max_tool_calls }}
           exploration_token_budget: ${{ inputs.exploration_token_budget }}
           context_window_tokens: ${{ inputs.context_window_tokens }}
+          reasoning_effort: ${{ inputs.reasoning_effort }}
           max_inline_comments: ${{ inputs.max_inline_comments }}
           inline_severity_threshold: ${{ inputs.inline_severity_threshold }}
           request_changes_threshold: ${{ inputs.request_changes_threshold }}

@@ -1,3 +1,4 @@
+import * as core from "@actions/core";
 import { anthropic } from "@ai-sdk/anthropic";
 import { openai } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
@@ -13,6 +14,7 @@ import {
   wrapLanguageModel,
 } from "ai";
 import { z } from "zod";
+import type { ReasoningEffort } from "./schema.js";
 
 export { tool as defineTool };
 
@@ -27,6 +29,30 @@ export function resolveModel(id: string) {
   );
 }
 
+const CLAUDE_EFFORTS: readonly ReasoningEffort[] = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+/** Rejects a reasoning effort the model's provider is known to refuse, before any call. */
+export function checkReasoningEffort(
+  modelId: string,
+  reasoningEffort: ReasoningEffort | undefined,
+): void {
+  if (
+    reasoningEffort !== undefined &&
+    modelId.startsWith("claude-") &&
+    !CLAUDE_EFFORTS.includes(reasoningEffort)
+  ) {
+    throw new Error(
+      `Input reasoning_effort "${reasoningEffort}" is not available for Claude models; use one of ${CLAUDE_EFFORTS.join(", ")}`,
+    );
+  }
+}
+
 /**
  * vLLM-style servers enforce response_format as a decoding grammar over the
  * whole completion, where it would block tool calls. Sent only on tool-free
@@ -36,6 +62,49 @@ export const responseFormatOnlyWithoutTools: LanguageModelMiddleware = {
   transformParams: async ({ params }) =>
     params.tools?.length ? { ...params, responseFormat: undefined } : params,
 };
+
+const RATE_LIMIT_MAX_WAIT_MS = 60 * 60_000;
+const RETRY_AFTER_MIN_S = 5;
+const RETRY_AFTER_MAX_S = 10;
+const RETRY_AFTER_DEFAULT_S = 10;
+
+/**
+ * Wraps fetch so a 429 from the endpoint (another review holding the key's
+ * request slot) is waited out and the same request resent. All calls through
+ * one wrapper share maxWaitMs of waiting; once it is spent, every 429 goes
+ * straight to the SDK, whose own error carries the endpoint's message. A
+ * review queued behind another one usually waits for that whole review.
+ */
+export function waitOnRateLimit(
+  fetchImpl: typeof fetch,
+  maxWaitMs: number,
+): typeof fetch {
+  let waited = 0;
+  return async (input, init) => {
+    for (;;) {
+      const res = await fetchImpl(input, init);
+      if (res.status !== 429) return res;
+      const header = Number.parseFloat(res.headers.get("retry-after") ?? "");
+      const seconds = Number.isFinite(header)
+        ? Math.min(Math.max(header, RETRY_AFTER_MIN_S), RETRY_AFTER_MAX_S)
+        : RETRY_AFTER_DEFAULT_S;
+      const ms = seconds * 1_000 + Math.random() * 2_000;
+      if (waited + ms > maxWaitMs) return res;
+      const said = (await res.text()).slice(0, 300);
+      core.info(
+        `Model endpoint answered 429, retrying in ${Math.round(ms / 1_000)}s: ${said}`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      waited += ms;
+    }
+  };
+}
+
+// One wrapper per process, so a review's waiting stays within one budget.
+const rateLimitedFetch = waitOnRateLimit(
+  (input, init) => globalThis.fetch(input, init),
+  RATE_LIMIT_MAX_WAIT_MS,
+);
 
 /** org/model ids resolve against the endpoint configured via action inputs. */
 function openAiCompatibleModel(id: string) {
@@ -51,6 +120,7 @@ function openAiCompatibleModel(id: string) {
     baseURL,
     apiKey: process.env.OPENAI_COMPATIBLE_API_KEY,
     supportsStructuredOutputs: true,
+    fetch: rateLimitedFetch,
   })(id);
   return wrapLanguageModel({
     model,
@@ -261,6 +331,26 @@ export interface AgenticCallOptions<T> {
   maxToolCalls: number;
   tokenBudget?: number;
   contextWindowTokens: number;
+  reasoningEffort: ReasoningEffort | undefined;
+}
+
+/**
+ * Provider options for every call. Each provider reads only its own key, so a
+ * reasoning effort is set for all three. Claude takes it as effort rather than
+ * extended thinking, which cannot run next to the forced json tool call; OpenAI
+ * gets no reasoning summary, which the SDK would otherwise request with it.
+ */
+export function callProviderOptions(
+  reasoningEffort: ReasoningEffort | undefined,
+): Record<string, Record<string, string | null>> {
+  if (reasoningEffort === undefined) {
+    return { anthropic: { structuredOutputMode: "jsonTool" } };
+  }
+  return {
+    anthropic: { structuredOutputMode: "jsonTool", effort: reasoningEffort },
+    openai: { reasoningEffort, reasoningSummary: null },
+    openaiCompatible: { reasoningEffort },
+  };
 }
 
 /**
@@ -278,9 +368,7 @@ export async function runStructured<T>(
     typeof opts.modelId === "string"
       ? resolveModel(opts.modelId)
       : opts.modelId;
-  const providerOptions = {
-    anthropic: { structuredOutputMode: "jsonTool" },
-  } as const;
+  const providerOptions = callProviderOptions(opts.reasoningEffort);
   const system =
     typeof opts.modelId === "string" && opts.modelId.includes("/")
       ? `${opts.system}\n\n${schemaAsPromptText(opts.schema)}`

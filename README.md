@@ -117,7 +117,8 @@ Only rule files matching the PR's changed paths are loaded.
 | model | claude-opus-4-8 | Any claude-* or gpt-*/o* model id, or an org/model id from an OpenAI-compatible endpoint |
 | max_tool_calls | 50 | Exploration cap; a runaway guard, raise it for large repos |
 | exploration_token_budget | 5000000 | Total token cap; when spent, the review wraps up early with what it has found |
-| context_window_tokens | 200000 | Context window of the model; exploration wraps up 50k tokens before it fills |
+| context_window_tokens | 200000 | Context window of the model; sets how much diff goes in the prompt (when the diff is larger, the biggest files are left to the exploration tools), and exploration wraps up 50k tokens before it fills. When you raise it, raise exploration_token_budget too: every step re-sends the prompt and counts against that budget |
+| reasoning_effort | unset | How hard the model reasons: none, minimal, low, medium, high, xhigh or max. Unset keeps the model's default. Claude takes low to max as its effort setting, OpenAI reasoning models take it as their reasoning effort and other OpenAI models ignore it, and OpenAI-compatible servers get it as reasoning_effort and decide what each value means. A value the model refuses fails the review with the provider's error |
 | max_inline_comments | 15 | Extra findings collapse into the review body |
 | inline_severity_threshold | minor | Minimum severity posted inline; nits never post inline |
 | request_changes_threshold | major | Minimum severity for a REQUEST_CHANGES verdict |

@@ -10,6 +10,7 @@ import { buildVerifyPreamble, buildVerifyPrompt } from "./prompts.js";
 import { threadStatus } from "./review.js";
 import {
   type Finding,
+  type ReasoningEffort,
   type Severity,
   severities,
   verificationSchema,
@@ -17,6 +18,17 @@ import {
 
 const VERIFY_TOOL_CALLS = 10;
 const MAX_VERIFIED_FINDINGS = 20;
+
+/** The error message followed by its chain of causes, which carry the network or parse detail. */
+function describeError(err: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = err;
+  while (current !== undefined && parts.length < 4) {
+    parts.push(current instanceof Error ? current.message : String(current));
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return parts.join(" <- caused by: ");
+}
 
 /**
  * Phase 2: re-examines each candidate finding with fresh tool access and keeps
@@ -35,6 +47,7 @@ export async function verifyFindings(opts: {
   requestChangesThreshold: Severity;
   tools: ReturnType<typeof makeExploreTools>;
   contextWindowTokens: number;
+  reasoningEffort: ReasoningEffort | undefined;
   files: FileDiff[];
 }): Promise<{
   findings: Finding[];
@@ -114,6 +127,7 @@ export async function verifyFindings(opts: {
         tools: opts.tools,
         maxToolCalls: VERIFY_TOOL_CALLS,
         contextWindowTokens: opts.contextWindowTokens,
+        reasoningEffort: opts.reasoningEffort,
       });
       usage = addUsage(usage, callUsage);
       if (output.verdict === "confirmed") {
@@ -125,7 +139,7 @@ export async function verifyFindings(opts: {
       }
     } catch (err) {
       core.warning(
-        `Verification call failed for ${finding.path}:${finding.line}: ${err instanceof Error ? err.message : String(err)}`,
+        `Verification call failed for ${finding.path}:${finding.line}: ${describeError(err)}`,
       );
       if (reReview) unverified.push(finding);
       else confirm(finding, { suggestion: "drop" });
